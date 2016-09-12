@@ -88,6 +88,7 @@ import java.io.StringReader;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.Map.Entry;
 import java.util.Properties;
 
@@ -359,6 +360,7 @@ public class GpsLocationProvider implements LocationProviderInterface {
     private String mC2KServerHost;
     private int mC2KServerPort;
     private boolean mSuplEsEnabled = false;
+    private HashSet<String> mLastKnownMccMnc;
 
     private final Context mContext;
     private final NtpTrustedTime mNtpTime;
@@ -482,18 +484,14 @@ public class GpsLocationProvider implements LocationProviderInterface {
     };
 
     private void subscriptionOrSimChanged(Context context) {
-        Log.d(TAG, "received SIM related action: ");
-        TelephonyManager phone = (TelephonyManager)
-                mContext.getSystemService(Context.TELEPHONY_SERVICE);
-        String mccMnc = phone.getSimOperator();
-        if (!TextUtils.isEmpty(mccMnc)) {
-            Log.d(TAG, "SIM MCC/MNC is available: " + mccMnc);
-            synchronized (mLock) {
+        HashSet<String> mccMnc = getKnownMccMnc(context);
+        Log.d(TAG, "received SIM change, new known MCC/MNC: " + mccMnc);
+        synchronized (mLock) {
+            if (!mccMnc.isEmpty() && !mccMnc.equals(mLastKnownMccMnc)) {
                 reloadGpsProperties(context, mProperties);
                 mNIHandler.setSuplEsEnabled(mSuplEsEnabled);
             }
-        } else {
-            Log.d(TAG, "SIM MCC/MNC is still not available");
+            mLastKnownMccMnc = mccMnc;
         }
     }
 
@@ -585,6 +583,20 @@ public class GpsLocationProvider implements LocationProviderInterface {
         }
     }
 
+    private HashSet<String> getKnownMccMnc(Context context) {
+        final TelephonyManager phone = (TelephonyManager)
+                context.getSystemService(Context.TELEPHONY_SERVICE);
+        final HashSet<String> mccMnc = new HashSet<String>();
+        final int phoneCnt = phone.getPhoneCount();
+        for (int i = 0;i < phoneCnt; ++i) {
+            String operator = phone.getNetworkOperatorForPhone(i);
+            if (!TextUtils.isEmpty(operator)) {
+                mccMnc.add(operator);
+            }
+        }
+        return mccMnc;
+    }
+
     private void loadPropertiesFromResource(Context context,
                                             Properties properties) {
         String[] configValues = context.getResources().getStringArray(
@@ -649,6 +661,8 @@ public class GpsLocationProvider implements LocationProviderInterface {
 
         // Construct internal handler
         mHandler = new ProviderHandler(looper);
+
+        mLastKnownMccMnc = getKnownMccMnc(mContext);
 
         // Load GPS configuration and register listeners in the background:
         // some operations, such as opening files and registering broadcast receivers, can take a
@@ -1511,6 +1525,72 @@ public class GpsLocationProvider implements LocationProviderInterface {
     }
 
     /**
+     * Count number of GNSS satellites used in fix.
+     *
+     * We could not rely on Integer.bitCount as GNSS used-in-fix info is not
+     * represented as a bit-mask.
+     */
+    private int countGnssSvUsedInFix(final int gnssSvCount) {
+        int result = 0;
+
+        for (int i = 0; i < gnssSvCount; i++) {
+            if (mSvUsedInFix[i]) {
+                result++;
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * called from native code to update GNSS SV info
+     */
+    private void reportGnssSvStatus() {
+        final int svCount = native_read_gnss_sv_status(
+                mSvs,
+                mSnrs,
+                mSvElevations,
+                mSvAzimuths,
+                mSvEphemerisPresences,
+                mSvAlmanacPresences,
+                mSvUsedInFix);
+        mListenerHelper.onGnssSvStatusChanged(
+                svCount,
+                mSvs,
+                mSnrs,
+                mSvElevations,
+                mSvAzimuths,
+                mSvEphemerisPresences,
+                mSvAlmanacPresences,
+                mSvUsedInFix);
+
+        if (VERBOSE) {
+            Log.v(TAG, "GNSS SV count: " + svCount);
+            for (int i = 0; i < svCount; i++) {
+                Log.v(TAG, "sv: " + mSvs[i] +
+                        " snr: " + mSnrs[i]/10 +
+                        " elev: " + mSvElevations[i] +
+                        " azimuth: " + mSvAzimuths[i] +
+                        (!mSvEphemerisPresences[i] ? "  " : " E") +
+                        (!mSvAlmanacPresences[i] ? "  " : " A") +
+                        (!mSvUsedInFix[i] ? "" : "U"));
+            }
+        }
+
+        // return number of sets used in fix instead of total
+        updateStatus(mStatus, countGnssSvUsedInFix(svCount));
+
+        if (mNavigating && mStatus == LocationProvider.AVAILABLE && mLastFixTime > 0 &&
+            System.currentTimeMillis() - mLastFixTime > RECENT_FIX_TIMEOUT) {
+            // send an intent to notify that the GPS is no longer receiving fixes.
+            Intent intent = new Intent(LocationManager.GPS_FIX_CHANGE_ACTION);
+            intent.putExtra(LocationManager.EXTRA_GPS_ENABLED, false);
+            mContext.sendBroadcastAsUser(intent, UserHandle.ALL);
+            updateStatus(LocationProvider.TEMPORARILY_UNAVAILABLE, mSvCount);
+        }
+    }
+
+    /**
      * called from native code to update AGPS status
      */
     private void reportAGpsStatus(int type, int status, byte[] ipaddr) {
@@ -1934,7 +2014,7 @@ public class GpsLocationProvider implements LocationProviderInterface {
                     type = AGPS_REF_LOCATION_TYPE_GSM_CELLID;
                 }
                 native_agps_set_ref_location_cellid(type, mcc, mnc,
-                        gsm_cell.getLac(), gsm_cell.getCid());
+                        gsm_cell.getLac(), gsm_cell.getCid(), gsm_cell.getPsc());
             } else {
                 Log.e(TAG,"Error getting cell location info.");
             }
@@ -2243,12 +2323,18 @@ public class GpsLocationProvider implements LocationProviderInterface {
     private static final int ALMANAC_MASK = 1;
     private static final int USED_FOR_FIX_MASK = 2;
 
+    // GNSS extension
+    private static final int MAX_GNSS_SVS = 256;
+
     // preallocated arrays, to avoid memory allocation in reportStatus()
-    private int mSvs[] = new int[MAX_SVS];
-    private float mSnrs[] = new float[MAX_SVS];
-    private float mSvElevations[] = new float[MAX_SVS];
-    private float mSvAzimuths[] = new float[MAX_SVS];
+    private int mSvs[] = new int[MAX_GNSS_SVS];
+    private float mSnrs[] = new float[MAX_GNSS_SVS];
+    private float mSvElevations[] = new float[MAX_GNSS_SVS];
+    private float mSvAzimuths[] = new float[MAX_GNSS_SVS];
     private int mSvMasks[] = new int[3];
+    private boolean mSvEphemerisPresences[] = new boolean[MAX_GNSS_SVS];
+    private boolean mSvAlmanacPresences[] = new boolean[MAX_GNSS_SVS];
+    private boolean mSvUsedInFix[] = new boolean[MAX_GNSS_SVS];
     private int mSvCount;
     // preallocated to avoid memory allocation in reportNmea()
     private byte[] mNmeaBuffer = new byte[120];
@@ -2270,6 +2356,12 @@ public class GpsLocationProvider implements LocationProviderInterface {
     // mask[0] is ephemeris mask and mask[1] is almanac mask
     private native int native_read_sv_status(int[] svs, float[] snrs,
             float[] elevations, float[] azimuths, int[] masks);
+    // returns number of GNSS SVs
+    private native int native_read_gnss_sv_status(int[] svs, float[] snrs,
+            float[] elevations, float[] azimuths,
+            boolean[] ephemerisPresences,
+            boolean[] almanacPresences,
+            boolean[] usedInFix);
     private native int native_read_nmea(byte[] buffer, int bufferSize);
     private native void native_inject_location(double latitude, double longitude, float accuracy);
 
@@ -2293,7 +2385,7 @@ public class GpsLocationProvider implements LocationProviderInterface {
 
     // AGPS ril suport
     private native void native_agps_set_ref_location_cellid(int type, int mcc, int mnc,
-            int lac, int cid);
+            int lac, int cid, int psc);
     private native void native_agps_set_id(int type, String setid);
 
     private native void native_update_network_state(boolean connected, int type,
